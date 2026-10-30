@@ -32,13 +32,12 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TARGET_CHAT_ID = os.getenv("TELEGRAM_USER_ID")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
 
-# Ambil port bawaan Render dengan aman
 try:
     PORT = int(os.environ.get("PORT", 8080))
 except (ValueError, TypeError):
     PORT = 8080
 
-# Web server port binding untuk Render health check
+# Web server minimal untuk health check Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -52,16 +51,15 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.end_headers()
         
     def log_message(self, format, *args):
-        # Mute logging akses polling berkala agar log Render tetap bersih
         return
 
 def run_health_server():
     try:
         server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-        print(f"[HealthCheck] Server berhasil listening di 0.0.0.0:{PORT}")
+        print(f"[HealthCheck] Server aktif di port {PORT}")
         server.serve_forever()
     except Exception as e:
-        print(f"[HealthCheck ERROR] Gagal menjalankan HTTP Server: {e}")
+        print(f"[HealthCheck ERROR] {e}")
 
 def get_main_keyboard():
     keyboard = [
@@ -121,8 +119,11 @@ async def send_next_partikel(update: Update, user_id: int):
     await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 async def send_next_drill_translation(update: Update, user_id: int):
-    await update.message.reply_text("Alleia lagi siapin kalimat latihan berikutnya...")
-    kalimat_id = generate_drill_prompt()
+    status_msg = await update.message.reply_text("Alleia lagi siapin kalimat latihan berikutnya...")
+    
+    # Non-blocking call ke Gemini
+    kalimat_id = await asyncio.to_thread(generate_drill_prompt)
+    
     sess = get_user_session(user_id)
     sess["drill_target"] = kalimat_id
     save_user_session(user_id, sess)
@@ -176,6 +177,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(greeting, reply_markup=markup)
         return
 
+    # Penanganan aksi berdasarkan mode aktif
     if mode == "PARTIKEL":
         idx = sess.get("partikel_idx", 0)
         current_q = PARTIKEL_DRILLS[idx]
@@ -199,7 +201,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await update.message.reply_text("Alleia periksa terjemahan kamu sebentar ya...")
-        evaluasi = evaluate_translation(target_id, text)
+        evaluasi = await asyncio.to_thread(evaluate_translation, target_id, text)
         await update.message.reply_text(evaluasi, parse_mode="Markdown")
 
         await send_next_drill_translation(update, user_id)
@@ -208,8 +210,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Alleia lagi mengetik...")
         history = sess.get("kaiwa_history", [])
         
-        reply = chat_kaiwa_with_history(history, text)
-        
+        try:
+            reply = await asyncio.to_thread(chat_kaiwa_with_history, history, text)
+        except Exception as e:
+            reply = f"Gomen ne, sistem Alleia ada error: {e}"
+
         append_kaiwa_history(user_id, "user", text)
         append_kaiwa_history(user_id, "model", reply)
 
@@ -249,12 +254,10 @@ def main():
         print("[FATAL] TELEGRAM_BOT_TOKEN belum diset di environment variables!")
         sys.exit(1)
 
-    print("[Startup] Menjalankan HTTP server dummy...")
     http_thread = threading.Thread(target=run_health_server, daemon=True)
     http_thread.start()
 
     try:
-        print("[Startup] Membangun bot Telegram...")
         app = ApplicationBuilder().token(TOKEN).build()
 
         scheduler = BackgroundScheduler(timezone=pytz.timezone(TIMEZONE))
@@ -266,10 +269,10 @@ def main():
         app.add_handler(CommandHandler("end", end_handler))
         app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
 
-        print(f"[Alleia] Bot aktif dan siap polling. Listening port: {PORT}")
+        print(f"[Alleia] Bot aktif dan siap polling di port {PORT}")
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
-        print(f"[FATAL ERROR] Terjadi exception saat menjalankan bot:\n{traceback.format_exc()}")
+        print(f"[FATAL ERROR] {traceback.format_exc()}")
         sys.exit(1)
 
 if __name__ == "__main__":
