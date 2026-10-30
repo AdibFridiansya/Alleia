@@ -4,13 +4,25 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 import pytz
 import asyncio
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from curriculum import CURRICULUM
-from tracker import get_progress, update_progress
-from ai_service import get_kana_reading, chat_kaiwa
+from memory_manager import get_user_session, save_user_session, append_kaiwa_history
+from partikel_data import PARTIKEL_DRILLS
+from ai_service import (
+    generate_kana_reading,
+    evaluate_translation,
+    generate_drill_prompt,
+    chat_kaiwa_with_history
+)
 
 load_dotenv()
 
@@ -19,13 +31,13 @@ TARGET_CHAT_ID = os.getenv("TELEGRAM_USER_ID")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
 PORT = int(os.environ.get("PORT", 8080))
 
-# Web Server minimalis untuk health check Render
+# Web server port binding untuk Render health check
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Nihongo Bot is active and running!")
+        self.wfile.write(b"Bot is alive!")
         
     def log_message(self, format, *args):
         return
@@ -34,139 +46,216 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
     server.serve_forever()
 
+def get_main_keyboard():
+    keyboard = [
+        ["🎯 Drill Partikel (Rumpang)", "✍️ Drill Terjemah (ID -> JP)"],
+        ["💬 Kaiwa (Chat Romaji)", "🛑 Selesai / Menu Utama (/end)"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_chat.id
+    sess = get_user_session(user_id)
+    sess["mode"] = "IDLE"
+    save_user_session(user_id, sess)
+
     msg = (
-        f"🤖 **Nihongo Engineering Assistant Aktif!**\n"
+        f"Konnichiwa! Bot Asisten Bahasa Jepang siap menemani belajar.\n"
         f"ID Telegram Anda: `{user_id}`\n\n"
-        "Perintah yang dapat digunakan:\n"
-        "• `/materi` — Pelajari teori partikel/konjugasi unit aktif\n"
-        "• `/drill` — Mulai latihan soal pemahaman\n"
-        "• `/baca` — Minta teks latihan membaca kana instan\n"
-        "• Kirim pesan teks langsung untuk latihan percakapan `/kaiwa` bersama Senpai."
+        "Silakan pilih menu langsung menggunakan tombol di bawah:\n"
+        "• 🎯 **Drill Partikel**: Latihan mengisi partikel kalimat rumpang (Otomatis Next)\n"
+        "• ✍️ **Drill Terjemah**: Menerjemahkan kalimat ID ke JP (Otomatis Next)\n"
+        "• 💬 **Kaiwa**: Ngobrol santai format Romaji + arti (Senpai mengingat obrolan Anda)\n"
+        "• Ketik `/end` kapan saja untuk keluar ke menu utama."
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
-async def materi_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prog = get_progress()
-    unit_id = prog["current_unit"]
-    unit_data = CURRICULUM.get(unit_id)
-    if not unit_data:
-        await update.message.reply_text("Semua unit kurikulum telah selesai dipelajari!")
-        return
-    await update.message.reply_text(unit_data["explanation"], parse_mode="Markdown")
+async def end_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    sess = get_user_session(user_id)
+    sess["mode"] = "IDLE"
+    sess["drill_target"] = ""
+    save_user_session(user_id, sess)
 
-async def drill_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prog = get_progress()
-    unit_id = prog["current_unit"]
-    idx = prog["drill_index"]
-    unit_data = CURRICULUM.get(unit_id)
+    await update.message.reply_text(
+        "Sesi selesai. Kembali ke menu utama. Silakan pilih menu di bawah:",
+        reply_markup=get_main_keyboard()
+    )
 
-    if not unit_data or idx >= len(unit_data["drills"]):
-        unit_id += 1
+# --- Sub-fitur 1: Drill Partikel Rumpang ---
+async def send_next_partikel(update: Update, user_id: int):
+    sess = get_user_session(user_id)
+    idx = sess.get("partikel_idx", 0)
+    
+    if idx >= len(PARTIKEL_DRILLS):
+        sess["partikel_idx"] = 0
         idx = 0
-        update_progress(unit=unit_id, drill_idx=idx, waiting=False)
-        unit_data = CURRICULUM.get(unit_id)
-        if not unit_data:
-            await update.message.reply_text("🎉 Selamat, seluruh latihan yang tersedia telah tuntas!")
-            return
-        await update.message.reply_text(f"Maju ke {unit_data['title']}!")
 
-    drill = unit_data["drills"][idx]
-    update_progress(waiting=True)
+    q = PARTIKEL_DRILLS[idx]
+    keyboard = [[opt] for opt in q["options"]]
+    keyboard.append(["🛑 Selesai / Menu Utama (/end)"])
+    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
     text = (
-        f"🎯 **Drill {unit_data['title']} (Soal {idx + 1}/{len(unit_data['drills'])})**\n\n"
-        f"{drill['question']}\n\n"
-        f"{drill['options']}\n\n"
-        "Ketik pilihan jawaban Anda (a / b / c):"
+        f"🎯 **Drill Partikel (Soal {idx + 1}/{len(PARTIKEL_DRILLS)})**\n\n"
+        f"Kalimat:\n`{q['sentence']}`\n\n"
+        f"{q['question']}\n"
+        "Pilih tombol jawaban di bawah:"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
-async def baca_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Menyiapkan teks kana...")
-    kana_text = get_kana_reading("keseharian kantor dan komunikasi teknis")
-    pesan = (
-        "📖 **Latihan Membaca Kana**\n"
-        "────────────────────\n\n"
-        f"{kana_text}\n\n"
-        "────────────────────\n"
-        "Bacalah perlahan per frasa untuk melatih kelancaran pelafalan Anda."
+# --- Sub-fitur 2: Drill Terjemah ID -> JP ---
+async def send_next_drill_translation(update: Update, user_id: int):
+    await update.message.reply_text("Menyiapkan kalimat latihan berikutnya...")
+    kalimat_id = generate_drill_prompt()
+    sess = get_user_session(user_id)
+    sess["drill_target"] = kalimat_id
+    save_user_session(user_id, sess)
+
+    keyboard = [["🛑 Selesai / Menu Utama (/end)"]]
+    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+    text = (
+        "✍️ **Drill Terjemahan (ID -> JP)**\n\n"
+        f"Terjemahkan ke Bahasa Jepang:\n"
+        f"👉 **"{kalimat_id}"**\n\n"
+        "*(Boleh tulis menggunakan Romaji, Hiragana, atau Kanji)*"
     )
-    await update.message.reply_text(pesan, parse_mode="Markdown")
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
-async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prog = get_progress()
-    user_text = update.message.text.strip()
+# --- Central Message Handler ---
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_chat.id
+    text = update.message.text.strip()
+    sess = get_user_session(user_id)
+    mode = sess.get("mode", "IDLE")
 
-    # Cek apakah sedang menjawab soal drill
-    if prog.get("waiting_answer"):
-        unit_data = CURRICULUM.get(prog["current_unit"])
-        current_drill = unit_data["drills"][prog["drill_index"]]
+    # Deteksi tombol kembali
+    if text in ["🛑 Selesai / Menu Utama (/end)", "/end"]:
+        await end_handler(update, context)
+        return
+
+    # Pemilihan Menu Awal
+    if text == "🎯 Drill Partikel (Rumpang)":
+        sess["mode"] = "PARTIKEL"
+        save_user_session(user_id, sess)
+        await send_next_partikel(update, user_id)
+        return
+
+    elif text == "✍️ Drill Terjemah (ID -> JP)":
+        sess["mode"] = "DRILL"
+        save_user_session(user_id, sess)
+        await send_next_drill_translation(update, user_id)
+        return
+
+    elif text == "💬 Kaiwa (Chat Romaji)":
+        sess["mode"] = "KAIWA"
+        save_user_session(user_id, sess)
         
-        jawaban_user = user_text.lower()
-        if jawaban_user in ["a", "b", "c"]:
-            if jawaban_user == current_drill["answer"]:
-                status = "✅ **Tepat sekali!**\n"
-            else:
-                status = f"❌ **Kurang tepat.** (Jawaban benar: {current_drill['answer']})\n"
+        keyboard = [["🛑 Selesai / Menu Utama (/end)"]]
+        markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        # Sapaan pembuka awal dengan Romaji & arti
+        greeting = (
+            "Konnichiwa! Kyou wa dou deshita ka? Genki desu ka?\n"
+            "(Halo! Bagaimana hari Anda hari ini? Apakah sehat?)\n\n"
+            "Silakan ketik balasan Anda santai saja. Ketik /end jika ingin selesai."
+        )
+        append_kaiwa_history(user_id, "model", greeting)
+        await update.message.reply_text(greeting, reply_markup=markup)
+        return
 
-            evaluasi = f"{status}\n💡 *Catatan:* {current_drill['note']}\n\nKetik `/drill` untuk lanjut ke soal berikutnya."
-            update_progress(drill_idx=prog["drill_index"] + 1, waiting=False)
-            await update.message.reply_text(evaluasi, parse_mode="Markdown")
+    # Proses Sesuai Mode Aktif
+    if mode == "PARTIKEL":
+        idx = sess.get("partikel_idx", 0)
+        current_q = PARTIKEL_DRILLS[idx]
+
+        if text == current_q["answer"]:
+            hasil = "✅ **Benar sekali!**\n\n"
+        else:
+            hasil = f"❌ **Kurang tepat.** Jawaban benar: `{current_q['answer']}`\n\n"
+
+        penjelasan = f"{hasil}💡 **Catatan:**\n{current_q['explanation']}"
+        await update.message.reply_text(penjelasan, parse_mode="Markdown")
+
+        # Auto Next ke soal berikutnya
+        sess["partikel_idx"] = (idx + 1) % len(PARTIKEL_DRILLS)
+        save_user_session(user_id, sess)
+        await send_next_partikel(update, user_id)
+
+    elif mode == "DRILL":
+        target_id = sess.get("drill_target", "")
+        if not target_id:
+            await send_next_drill_translation(update, user_id)
             return
 
-    # Sesi Kaiwa / Chatting percakapan
-    await update.message.reply_text("Senpai sedang menyusun balasan...")
-    reply = chat_kaiwa(user_text)
-    await update.message.reply_text(reply)
+        await update.message.reply_text("Sedang mengevaluasi terjemahan Anda...")
+        evaluasi = evaluate_translation(target_id, text)
+        await update.message.reply_text(evaluasi, parse_mode="Markdown")
 
-# Fungsi pembungkus pengiriman jadwal otomatis via Background thread
-def scheduled_push_sync(app, topic: str):
+        # Auto Next langsung berikan soal berikutnya
+        await send_next_drill_translation(update, user_id)
+
+    elif mode == "KAIWA":
+        await update.message.reply_text("Senpai sedang mengetik...")
+        history = sess.get("kaiwa_history", [])
+        
+        reply = chat_kaiwa_with_history(history, text)
+        
+        append_kaiwa_history(user_id, "user", text)
+        append_kaiwa_history(user_id, "model", reply)
+
+        keyboard = [["🛑 Selesai / Menu Utama (/end)"]]
+        markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(reply, reply_markup=markup)
+
+    else:
+        await update.message.reply_text(
+            "Silakan pilih menu latihan pada tombol di bawah:",
+            reply_markup=get_main_keyboard()
+        )
+
+# Pengiriman Terjadwal Otomatis (Reminder Bacaan Kana Jam 12.00 dan 20.00)
+def auto_send_kana(app, topic: str):
     target = os.getenv("TELEGRAM_USER_ID")
     if not target or target == "2005":
         return
-    kana_text = get_kana_reading(topic)
+    kana_text = generate_kana_reading(topic)
     pesan = (
-        "📖 **Sesi Membaca Kana Terjadwal**\n"
+        "⏰ **Pengingat Bacaan Kana Hari Ini**\n"
         "────────────────────\n\n"
         f"{kana_text}\n\n"
         "────────────────────\n"
-        "Luangkan waktu membaca teks kana di atas sejenak."
+        "Luangkan waktu 1 menit untuk membaca teks kana di atas dengan tenang."
     )
     try:
-        # Jalankan coroutine kirim pesan ke event loop Telegram
         loop = app.loop if hasattr(app, "loop") else asyncio.get_event_loop()
         asyncio.run_coroutine_threadsafe(
             app.bot.send_message(chat_id=int(target), text=pesan, parse_mode="Markdown"),
             loop
         )
     except Exception as e:
-        print(f"Gagal mengirim pesan terjadwal: {e}")
+        print(f"Gagal push bacaan: {e}")
 
 def main():
     if not TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN belum diset di environment variable!")
+        raise ValueError("TELEGRAM_BOT_TOKEN belum diset di environment variables!")
 
-    # Jalankan server HTTP dummy di background thread
     threading.Thread(target=run_health_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Menggunakan BackgroundScheduler agar aman di Python 3.14
     scheduler = BackgroundScheduler(timezone=pytz.timezone(TIMEZONE))
-    scheduler.add_job(scheduled_push_sync, "cron", hour=12, minute=0, args=[app, "kegiatan kantor dan jam istirahat"])
-    scheduler.add_job(scheduled_push_sync, "cron", hour=20, minute=0, args=[app, "pengujian kode, bug software, dan sensor"])
+    # Otomatis kirim reminder bacaan kana jam 12.00 siang dan 20.00 malam WIB
+    scheduler.add_job(auto_send_kana, "cron", hour=12, minute=0, args=[app, "kegiatan kantor dan jam istirahat"])
+    scheduler.add_job(auto_send_kana, "cron", hour=20, minute=0, args=[app, "pengujian software, bug, dan hardware"])
     scheduler.start()
 
-    # Daftarkan command handlers
     app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("materi", materi_handler))
-    app.add_handler(CommandHandler("drill", drill_handler))
-    app.add_handler(CommandHandler("baca", baca_handler))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_router))
+    app.add_handler(CommandHandler("end", end_handler))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
 
-    print(f"Bot aktif. Web server berjalan di port {PORT}...")
+    print(f"Bot revisi aktif. Server listening port {PORT}...")
     app.run_polling()
 
 if __name__ == "__main__":
