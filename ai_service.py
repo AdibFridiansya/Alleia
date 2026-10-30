@@ -30,6 +30,7 @@ SYARAT MUTLAK:
 
 def evaluate_translation(target_id: str, user_jp: str) -> str:
     prompt = f"""
+Nama Anda adalah Alleia, rekan belajar sekaligus teman kerja yang ramah dan suportif.
 Pengguna diminta menerjemahkan kalimat Bahasa Indonesia ini ke Bahasa Jepang:
 "{target_id}"
 
@@ -37,11 +38,11 @@ Jawaban Bahasa Jepang Pengguna:
 "{user_jp}"
 
 Instruksi Evaluasi:
-1. Periksa apakah partikel, konjugasi kerja/sifat, dan kosakatanya tepat dan wajar untuk situasi kerja/sehari-hari.
-2. Berikan penilaian ramah:
-   - Evaluasi singkat (Benar / Kurang Tepat beserta alasannya).
+1. Periksa apakah partikel, konjugasi kerja/sifat, dan kosakatanya tepat dan wajar.
+2. Berikan penilaian ramah bergaya Alleia:
+   - Evaluasi singkat (Benar / Kurang Tepat beserta alasannya secara ramah).
    - Kalimat alami versi standar (disertai romaji dan arti).
-   - Opsi formal/sopan jika ada perbedaan konteks.
+   - Opsi sopan/kantor jika ada.
 Gunakan format ringkas, jelas, dan memotivasi.
 """
     try:
@@ -64,17 +65,17 @@ Saya sedang memperbaiki bug pada modul sensor.
         res = client.models.generate_content(model=MODEL_NAME, contents=prompt)
         return res.text.strip()
     except Exception:
-        return "Saya sedang memeriksa laporan pengujian sistem bersama senior."
+        return "Saya sedang memeriksa laporan pengujian sistem bersama tim."
 
 def chat_kaiwa_with_history(history_list: list, user_message: str) -> str:
     system_instruction = """
-Anda adalah rekan kerja senior (Senpai) ramah asal Jepang.
+Nama Anda adalah Alleia. Anda adalah teman kerja/partner belajar asal Jepang yang ceria, ramah, dan suportif.
 ATURAN MUTLAK:
 1. JANGAN PERNAH MENGGUNAKAN HURUF KANA ATAU KANJI DALAM BALASAN ANDA.
 2. Tulis balasan HANYA DALAM DUA BAGIAN:
    - Bagian 1: Bahasa Jepang dalam format ROMAJI saja.
    - Bagian 2: Terjemahan Bahasa Indonesia di bawahnya.
-3. Selalu tanyakan kabar atau perkembangan aktivitas/rutinitas harian pengguna.
+3. Selalu tanyakan kabar atau perkembangan aktivitas/rutinitas harian pengguna dengan akrab.
 4. Ingat dan tanggapi konteks riwayat percakapan sebelumnya.
 
 Contoh format balasan:
@@ -83,10 +84,19 @@ Kyou wa dou deshita ka? Oshigoto wa junchou desu ka?
 """
 
     contents = []
-    for msg in history_list[-8:]:
+    
+    # Ambil riwayat percakapan terakhir
+    valid_history = list(history_list[-8:]) if history_list else []
+    
+    # Aturan wajib Gemini: Turn percakapan pertama HARUS dari role 'user'
+    while valid_history and valid_history[0].get("role") != "user":
+        valid_history.pop(0)
+
+    for msg in valid_history:
         role = "user" if msg["role"] == "user" else "model"
         contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["text"])]))
     
+    # Masukkan input user terkini
     contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_message)]))
 
     try:
@@ -101,4 +111,5 @@ Kyou wa dou deshita ka? Oshigoto wa junchou desu ka?
         )
         return res.text.strip()
     except Exception as e:
-        return f"Gomen ne, sistem sedang sibuk: {str(e)}"
+        print(f"[Gemini API Error] {e}")
+        return f"Gomen ne, Alleia lagi agak lambat jaringannya: {str(e)}"
