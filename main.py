@@ -2,10 +2,11 @@ import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import pytz
+import asyncio
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from curriculum import CURRICULUM
 from tracker import get_progress, update_progress
@@ -16,7 +17,7 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TARGET_CHAT_ID = os.getenv("TELEGRAM_USER_ID")
 TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.environ.get("PORT", 8080))
 
 # Web Server minimalis untuk health check Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -27,7 +28,6 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Nihongo Bot is active and running!")
         
     def log_message(self, format, *args):
-        # Mute logging akses http berkala agar log telegram tetap bersih
         return
 
 def run_health_server():
@@ -121,10 +121,10 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = chat_kaiwa(user_text)
     await update.message.reply_text(reply)
 
-# Pengiriman otomatis terjadwal
-async def scheduled_push(app, topic: str):
+# Fungsi pembungkus pengiriman jadwal otomatis via Background thread
+def scheduled_push_sync(app, topic: str):
     target = os.getenv("TELEGRAM_USER_ID")
-    if not target:
+    if not target or target == "2005":
         return
     kana_text = get_kana_reading(topic)
     pesan = (
@@ -135,7 +135,12 @@ async def scheduled_push(app, topic: str):
         "Luangkan waktu membaca teks kana di atas sejenak."
     )
     try:
-        await app.bot.send_message(chat_id=int(target), text=pesan, parse_mode="Markdown")
+        # Jalankan coroutine kirim pesan ke event loop Telegram
+        loop = app.loop if hasattr(app, "loop") else asyncio.get_event_loop()
+        asyncio.run_coroutine_threadsafe(
+            app.bot.send_message(chat_id=int(target), text=pesan, parse_mode="Markdown"),
+            loop
+        )
     except Exception as e:
         print(f"Gagal mengirim pesan terjadwal: {e}")
 
@@ -143,15 +148,15 @@ def main():
     if not TOKEN:
         raise ValueError("TELEGRAM_BOT_TOKEN belum diset di environment variable!")
 
-    # Jalankan background dummy web server untuk health check Render
+    # Jalankan server HTTP dummy di background thread
     threading.Thread(target=run_health_server, daemon=True).start()
 
     app = ApplicationBuilder().token(TOKEN).build()
 
-    # Jadwal bacaan otomatis jam 12.00 dan 20.00 WIB
-    scheduler = AsyncIOScheduler(timezone=pytz.timezone(TIMEZONE))
-    scheduler.add_job(scheduled_push, "cron", hour=12, minute=0, args=[app, "kegiatan kantor dan jam istirahat"])
-    scheduler.add_job(scheduled_push, "cron", hour=20, minute=0, args=[app, "pengujian kode, bug software, dan sensor"])
+    # Menggunakan BackgroundScheduler agar aman di Python 3.14
+    scheduler = BackgroundScheduler(timezone=pytz.timezone(TIMEZONE))
+    scheduler.add_job(scheduled_push_sync, "cron", hour=12, minute=0, args=[app, "kegiatan kantor dan jam istirahat"])
+    scheduler.add_job(scheduled_push_sync, "cron", hour=20, minute=0, args=[app, "pengujian kode, bug software, dan sensor"])
     scheduler.start()
 
     # Daftarkan command handlers
