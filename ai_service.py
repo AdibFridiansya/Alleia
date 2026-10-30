@@ -5,7 +5,7 @@ from google.genai import types
 
 load_dotenv()
 
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.8-flash"
 
 def get_client():
     api_key = os.getenv("GEMINI_API_KEY")
@@ -67,28 +67,20 @@ Saya sedang memperbaiki bug pada modul sensor.
         return "Saya sedang memeriksa laporan pengujian sistem bersama senior."
 
 def chat_kaiwa_with_history(history_list: list, user_message: str) -> str:
-    system_instruction = (
-        "Anda adalah rekan kerja senior (Senpai) ramah asal Jepang. "
-        "ATURAN MUTLAK:
-"
-        "1. JANGAN PERNAH MENGGUNAKAN HURUF KANA ATAU KANJI DALAM BALASAN ANDA.
-"
-        "2. Tulis balasan HANYA DALAM DUA BAGIAN:
-"
-        "   - Bagian 1: Bahasa Jepang dalam format ROMAJI saja.
-"
-        "   - Bagian 2: Terjemahan Bahasa Indonesia di bawahnya.
-"
-        "3. Selalu tanyakan kabar atau perkembangan aktivitas/rutinitas harian pengguna.
-"
-        "4. Ingat dan tanggapi konteks riwayat percakapan sebelumnya.
-"
-        "Contoh format balasan:
-"
-        "Kyou wa dou deshita ka? Oshigoto wa junchou desu ka?
-"
-        "(Bagaimana hari Anda hari ini? Apakah pekerjaan berjalan lancar?)"
-    )
+    system_instruction = """
+Anda adalah rekan kerja senior (Senpai) ramah asal Jepang.
+ATURAN MUTLAK:
+1. JANGAN PERNAH MENGGUNAKAN HURUF KANA ATAU KANJI DALAM BALASAN ANDA.
+2. Tulis balasan HANYA DALAM DUA BAGIAN:
+   - Bagian 1: Bahasa Jepang dalam format ROMAJI saja.
+   - Bagian 2: Terjemahan Bahasa Indonesia di bawahnya.
+3. Selalu tanyakan kabar atau perkembangan aktivitas/rutinitas harian pengguna.
+4. Ingat dan tanggapi konteks riwayat percakapan sebelumnya.
+
+Contoh format balasan:
+Kyou wa dou deshita ka? Oshigoto wa junchou desu ka?
+(Bagaimana hari Anda hari ini? Apakah pekerjaan berjalan lancar?)
+"""
 
     contents = []
     for msg in history_list[-8:]:
@@ -103,7 +95,7 @@ def chat_kaiwa_with_history(history_list: list, user_message: str) -> str:
             model=MODEL_NAME,
             contents=contents,
             config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
+                system_instruction=system_instruction.strip(),
                 temperature=0.7
             )
         )
