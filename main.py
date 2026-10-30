@@ -5,7 +5,7 @@ import pytz
 import asyncio
 from dotenv import load_dotenv
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -117,8 +117,8 @@ async def send_next_drill_translation(update: Update, user_id: int):
 
     text = (
         "✍️ **Drill Terjemahan (ID -> JP)**\n\n"
-        f"Terjemahkan ke Bahasa Jepang:\n"
-        f"👉 **"{kalimat_id}"**\n\n"
+        "Terjemahkan ke Bahasa Jepang:\n"
+        f"👉 **'{kalimat_id}'**\n\n"
         "*(Boleh tulis menggunakan Romaji, Hiragana, atau Kanji)*"
     )
     await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
@@ -155,7 +155,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [["🛑 Selesai / Menu Utama (/end)"]]
         markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
-        # Sapaan pembuka awal dengan Romaji & arti
         greeting = (
             "Konnichiwa! Kyou wa dou deshita ka? Genki desu ka?\n"
             "(Halo! Bagaimana hari Anda hari ini? Apakah sehat?)\n\n"
@@ -178,7 +177,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         penjelasan = f"{hasil}💡 **Catatan:**\n{current_q['explanation']}"
         await update.message.reply_text(penjelasan, parse_mode="Markdown")
 
-        # Auto Next ke soal berikutnya
         sess["partikel_idx"] = (idx + 1) % len(PARTIKEL_DRILLS)
         save_user_session(user_id, sess)
         await send_next_partikel(update, user_id)
@@ -193,7 +191,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         evaluasi = evaluate_translation(target_id, text)
         await update.message.reply_text(evaluasi, parse_mode="Markdown")
 
-        # Auto Next langsung berikan soal berikutnya
         await send_next_drill_translation(update, user_id)
 
     elif mode == "KAIWA":
@@ -246,7 +243,6 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     scheduler = BackgroundScheduler(timezone=pytz.timezone(TIMEZONE))
-    # Otomatis kirim reminder bacaan kana jam 12.00 siang dan 20.00 malam WIB
     scheduler.add_job(auto_send_kana, "cron", hour=12, minute=0, args=[app, "kegiatan kantor dan jam istirahat"])
     scheduler.add_job(auto_send_kana, "cron", hour=20, minute=0, args=[app, "pengujian software, bug, dan hardware"])
     scheduler.start()
