@@ -1,258 +1,105 @@
 import os
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import pytz
-import asyncio
 from dotenv import load_dotenv
-
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
-from apscheduler.schedulers.background import BackgroundScheduler
-
-from memory_manager import get_user_session, save_user_session, append_kaiwa_history
-from partikel_data import PARTIKEL_DRILLS
-from ai_service import (
-    generate_kana_reading,
-    evaluate_translation,
-    generate_drill_prompt,
-    chat_kaiwa_with_history
-)
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TARGET_CHAT_ID = os.getenv("TELEGRAM_USER_ID")
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Jakarta")
-PORT = int(os.environ.get("PORT", 8080))
+MODEL_NAME = "gemini-3.8-flash"
 
-# Web server port binding untuk Render health check
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-        
-    def log_message(self, format, *args):
-        return
+def get_client():
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY belum disetel!")
+    return genai.Client(api_key=api_key.strip())
 
-def run_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    server.serve_forever()
-
-def get_main_keyboard():
-    keyboard = [
-        ["🎯 Drill Partikel (Rumpang)", "✍️ Drill Terjemah (ID -> JP)"],
-        ["💬 Kaiwa (Chat Romaji)", "🛑 Selesai / Menu Utama (/end)"]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    sess = get_user_session(user_id)
-    sess["mode"] = "IDLE"
-    save_user_session(user_id, sess)
-
-    msg = (
-        f"Konnichiwa! Bot Asisten Bahasa Jepang siap menemani belajar.\n"
-        f"ID Telegram Anda: `{user_id}`\n\n"
-        "Silakan pilih menu langsung menggunakan tombol di bawah:\n"
-        "• 🎯 **Drill Partikel**: Latihan mengisi partikel kalimat rumpang (Otomatis Next)\n"
-        "• ✍️ **Drill Terjemah**: Menerjemahkan kalimat ID ke JP (Otomatis Next)\n"
-        "• 💬 **Kaiwa**: Ngobrol santai format Romaji + arti (Senpai mengingat obrolan Anda)\n"
-        "• Ketik `/end` kapan saja untuk keluar ke menu utama."
-    )
-    await update.message.reply_text(msg, reply_markup=get_main_keyboard(), parse_mode="Markdown")
-
-async def end_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    sess = get_user_session(user_id)
-    sess["mode"] = "IDLE"
-    sess["drill_target"] = ""
-    save_user_session(user_id, sess)
-
-    await update.message.reply_text(
-        "Sesi selesai. Kembali ke menu utama. Silakan pilih menu di bawah:",
-        reply_markup=get_main_keyboard()
-    )
-
-# --- Sub-fitur 1: Drill Partikel Rumpang ---
-async def send_next_partikel(update: Update, user_id: int):
-    sess = get_user_session(user_id)
-    idx = sess.get("partikel_idx", 0)
-    
-    if idx >= len(PARTIKEL_DRILLS):
-        sess["partikel_idx"] = 0
-        idx = 0
-
-    q = PARTIKEL_DRILLS[idx]
-    keyboard = [[opt] for opt in q["options"]]
-    keyboard.append(["🛑 Selesai / Menu Utama (/end)"])
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-    text = (
-        f"🎯 **Drill Partikel (Soal {idx + 1}/{len(PARTIKEL_DRILLS)})**\n\n"
-        f"Kalimat:\n`{q['sentence']}`\n\n"
-        f"{q['question']}\n"
-        "Pilih tombol jawaban di bawah:"
-    )
-    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
-
-# --- Sub-fitur 2: Drill Terjemah ID -> JP ---
-async def send_next_drill_translation(update: Update, user_id: int):
-    await update.message.reply_text("Menyiapkan kalimat latihan berikutnya...")
-    kalimat_id = generate_drill_prompt()
-    sess = get_user_session(user_id)
-    sess["drill_target"] = kalimat_id
-    save_user_session(user_id, sess)
-
-    keyboard = [["🛑 Selesai / Menu Utama (/end)"]]
-    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-    text = (
-        "✍️ **Drill Terjemahan (ID -> JP)**\n\n"
-        "Terjemahkan ke Bahasa Jepang:\n"
-        f"👉 **'{kalimat_id}'**\n\n"
-        "*(Boleh tulis menggunakan Romaji, Hiragana, atau Kanji)*"
-    )
-    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
-
-# --- Central Message Handler ---
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_chat.id
-    text = update.message.text.strip()
-    sess = get_user_session(user_id)
-    mode = sess.get("mode", "IDLE")
-
-    # Deteksi tombol kembali
-    if text in ["🛑 Selesai / Menu Utama (/end)", "/end"]:
-        await end_handler(update, context)
-        return
-
-    # Pemilihan Menu Awal
-    if text == "🎯 Drill Partikel (Rumpang)":
-        sess["mode"] = "PARTIKEL"
-        save_user_session(user_id, sess)
-        await send_next_partikel(update, user_id)
-        return
-
-    elif text == "✍️ Drill Terjemah (ID -> JP)":
-        sess["mode"] = "DRILL"
-        save_user_session(user_id, sess)
-        await send_next_drill_translation(update, user_id)
-        return
-
-    elif text == "💬 Kaiwa (Chat Romaji)":
-        sess["mode"] = "KAIWA"
-        save_user_session(user_id, sess)
-        
-        keyboard = [["🛑 Selesai / Menu Utama (/end)"]]
-        markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        greeting = (
-            "Konnichiwa! Kyou wa dou deshita ka? Genki desu ka?\n"
-            "(Halo! Bagaimana hari Anda hari ini? Apakah sehat?)\n\n"
-            "Silakan ketik balasan Anda santai saja. Ketik /end jika ingin selesai."
-        )
-        append_kaiwa_history(user_id, "model", greeting)
-        await update.message.reply_text(greeting, reply_markup=markup)
-        return
-
-    # Proses Sesuai Mode Aktif
-    if mode == "PARTIKEL":
-        idx = sess.get("partikel_idx", 0)
-        current_q = PARTIKEL_DRILLS[idx]
-
-        if text == current_q["answer"]:
-            hasil = "✅ **Benar sekali!**\n\n"
-        else:
-            hasil = f"❌ **Kurang tepat.** Jawaban benar: `{current_q['answer']}`\n\n"
-
-        penjelasan = f"{hasil}💡 **Catatan:**\n{current_q['explanation']}"
-        await update.message.reply_text(penjelasan, parse_mode="Markdown")
-
-        sess["partikel_idx"] = (idx + 1) % len(PARTIKEL_DRILLS)
-        save_user_session(user_id, sess)
-        await send_next_partikel(update, user_id)
-
-    elif mode == "DRILL":
-        target_id = sess.get("drill_target", "")
-        if not target_id:
-            await send_next_drill_translation(update, user_id)
-            return
-
-        await update.message.reply_text("Sedang mengevaluasi terjemahan Anda...")
-        evaluasi = evaluate_translation(target_id, text)
-        await update.message.reply_text(evaluasi, parse_mode="Markdown")
-
-        await send_next_drill_translation(update, user_id)
-
-    elif mode == "KAIWA":
-        await update.message.reply_text("Senpai sedang mengetik...")
-        history = sess.get("kaiwa_history", [])
-        
-        reply = chat_kaiwa_with_history(history, text)
-        
-        append_kaiwa_history(user_id, "user", text)
-        append_kaiwa_history(user_id, "model", reply)
-
-        keyboard = [["🛑 Selesai / Menu Utama (/end)"]]
-        markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text(reply, reply_markup=markup)
-
-    else:
-        await update.message.reply_text(
-            "Silakan pilih menu latihan pada tombol di bawah:",
-            reply_markup=get_main_keyboard()
-        )
-
-# Pengiriman Terjadwal Otomatis (Reminder Bacaan Kana Jam 12.00 dan 20.00)
-def auto_send_kana(app, topic: str):
-    target = os.getenv("TELEGRAM_USER_ID")
-    if not target or target == "2005":
-        return
-    kana_text = generate_kana_reading(topic)
-    pesan = (
-        "⏰ **Pengingat Bacaan Kana Hari Ini**\n"
-        "────────────────────\n\n"
-        f"{kana_text}\n\n"
-        "────────────────────\n"
-        "Luangkan waktu 1 menit untuk membaca teks kana di atas dengan tenang."
-    )
+def generate_kana_reading(topic: str = "keseharian kantor dan teknologi") -> str:
+    prompt = f"""
+Buat 1 paragraf pendek (3-4 kalimat ringkas level N4) tentang topik: {topic}.
+SYARAT MUTLAK:
+- Tulis HANYA dalam HIRAGANA dan KATAKANA dengan pemisahan spasi antar frasa/kata agar mudah dibaca pemula.
+- JANGAN gunakan Kanji sama sekali.
+- JANGAN sertakan terjemahan, salam pembuka, atau penutup. Langsung teks kananya saja.
+"""
     try:
-        loop = app.loop if hasattr(app, "loop") else asyncio.get_event_loop()
-        asyncio.run_coroutine_threadsafe(
-            app.bot.send_message(chat_id=int(target), text=pesan, parse_mode="Markdown"),
-            loop
-        )
+        client = get_client()
+        res = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+        return res.text.strip()
     except Exception as e:
-        print(f"Gagal push bacaan: {e}")
+        return f"Gagal membuat bacaan kana: {str(e)}"
 
-def main():
-    if not TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN belum diset di environment variables!")
+def evaluate_translation(target_id: str, user_jp: str) -> str:
+    prompt = f"""
+Nama Anda adalah Alleia, rekan belajar sekaligus teman kerja yang ramah dan suportif.
+Pengguna diminta menerjemahkan kalimat Bahasa Indonesia ini ke Bahasa Jepang:
+"{target_id}"
 
-    threading.Thread(target=run_health_server, daemon=True).start()
+Jawaban Bahasa Jepang Pengguna:
+"{user_jp}"
 
-    app = ApplicationBuilder().token(TOKEN).build()
+Instruksi Evaluasi:
+1. Periksa apakah partikel, konjugasi kerja/sifat, dan kosakatanya tepat dan wajar.
+2. Berikan penilaian ramah bergaya Alleia:
+   - Evaluasi singkat (Benar / Kurang Tepat beserta alasannya secara ramah).
+   - Kalimat alami versi standar (disertai romaji dan arti).
+   - Opsi sopan/kantor jika ada.
+Gunakan format ringkas, jelas, dan memotivasi.
+"""
+    try:
+        client = get_client()
+        res = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+        return res.text.strip()
+    except Exception as e:
+        return f"Gagal mengevaluasi: {str(e)}"
 
-    scheduler = BackgroundScheduler(timezone=pytz.timezone(TIMEZONE))
-    scheduler.add_job(auto_send_kana, "cron", hour=12, minute=0, args=[app, "kegiatan kantor dan jam istirahat"])
-    scheduler.add_job(auto_send_kana, "cron", hour=20, minute=0, args=[app, "pengujian software, bug, dan hardware"])
-    scheduler.start()
+def generate_drill_prompt() -> str:
+    prompt = """
+Buat TEPAT SATU kalimat Bahasa Indonesia sederhana yang relevan untuk situasi kerja kantor atau rekayasa software/hardware (tingkat N4/N3 dasar).
+Tujuannya adalah pengguna akan menerjemahkannya ke Bahasa Jepang.
+Keluarkan HANYA kalimat Bahasa Indonesia tersebut tanpa tanda kutip, tanpa nomor, tanpa pembuka/penutup.
+Contoh:
+Saya sedang memperbaiki bug pada modul sensor.
+"""
+    try:
+        client = get_client()
+        res = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+        return res.text.strip()
+    except Exception:
+        return "Saya sedang memeriksa laporan pengujian sistem bersama tim."
 
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("end", end_handler))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
+def chat_kaiwa_with_history(history_list: list, user_message: str) -> str:
+    system_instruction = """
+Nama Anda adalah Alleia. Anda adalah teman kerja/partner belajar asal Jepang yang ceria, ramah, dan suportif.
+ATURAN MUTLAK:
+1. JANGAN PERNAH MENGGUNAKAN HURUF KANA ATAU KANJI DALAM BALASAN ANDA.
+2. Tulis balasan HANYA DALAM DUA BAGIAN:
+   - Bagian 1: Bahasa Jepang dalam format ROMAJI saja.
+   - Bagian 2: Terjemahan Bahasa Indonesia di bawahnya.
+3. Selalu tanyakan kabar atau perkembangan aktivitas/rutinitas harian pengguna dengan akrab.
+4. Ingat dan tanggapi konteks riwayat percakapan sebelumnya.
 
-    print(f"Bot revisi aktif. Server listening port {PORT}...")
-    app.run_polling()
+Contoh format balasan:
+Kyou wa dou deshita ka? Oshigoto wa junchou desu ka?
+(Bagaimana hari Anda hari ini? Apakah pekerjaan berjalan lancar?)
+"""
 
-if __name__ == "__main__":
-    main()
+    contents = []
+    for msg in history_list[-8:]:
+        role = "user" if msg["role"] == "user" else "model"
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["text"])]))
+    
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_message)]))
+
+    try:
+        client = get_client()
+        res = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction.strip(),
+                temperature=0.7
+            )
+        )
+        return res.text.strip()
+    except Exception as e:
+        return f"Gomen ne, Alleia lagi agak pusing sebentar: {str(e)}"
